@@ -30,12 +30,13 @@
                     x.SetDisplayName("MassTransit RabbitMQ Stress Console");
                     x.SetServiceName("MassTransitStressConsole");
 
-                    x.AddCommandLineDefinition("username", v => username = v);
-                    x.AddCommandLineDefinition("password", v => password = v);
+                    x.AddCommandLineDefinition("rmqusername", v => username = v);
+                    x.AddCommandLineDefinition("rmqpassword", v => password = v);
                     x.AddCommandLineDefinition("uri", v => serviceBusUri = new Uri(v));
                     x.AddCommandLineDefinition("heartbeat", v => heartbeat = ushort.Parse(v));
                     x.AddCommandLineDefinition("iterations", v => iterations = int.Parse(v));
                     x.AddCommandLineDefinition("instances", v => instances = int.Parse(v));
+                    x.ApplyCommandLine();
 
                     x.Service(hostSettings => new StressService(serviceBusUri, username, password, heartbeat, iterations, instances));
                 });
