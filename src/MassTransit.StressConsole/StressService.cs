@@ -78,15 +78,7 @@
 
         public bool Stop(HostControl hostControl)
         {
-            _cancel.Cancel();
-
-            if (_serviceBus != null)
-            {
-                _serviceBus.Dispose();
-                _serviceBus = null;
-            }
-
-            var wait = Task.WaitAll(_clientTasks.ToArray(), 30.Seconds());
+            var wait = Task.WaitAll(_clientTasks.ToArray(), (_iterations * _instances / 100).Seconds());
             if (wait)
             {
                 _log.InfoFormat("Stress completed");
@@ -99,6 +91,15 @@
                 _log.InfoFormat("Med Response Time: {0}ms", (int?)_timings.SelectMany(x => x).Median());
                 _log.InfoFormat("95% Response Time: {0}ms", (int?)_timings.SelectMany(x => x).Percentile(95));
             }
+
+            _cancel.Cancel();
+
+            if (_serviceBus != null)
+            {
+                _serviceBus.Dispose();
+                _serviceBus = null;
+            }
+
             return wait;
         }
 
@@ -116,7 +117,9 @@
         {
             var composer = new TaskComposer<bool>(_cancel.Token, false);
 
-            Uri address = RabbitMqEndpointAddress.Parse(_serviceBusUri).ForQueue("stress_client" + instance.ToString()).Uri;
+            var endpointAddress = _serviceBus.Endpoint.Address as IRabbitMqEndpointAddress;
+            var queueName = string.Format("{0}_client_{1}", endpointAddress.Name, instance);
+            Uri address = RabbitMqEndpointAddress.Parse(_serviceBusUri).ForQueue(queueName).Uri;
 
             composer.Execute(() =>
                 {
@@ -188,7 +191,7 @@
                 {
                     var count = Interlocked.Decrement(ref _instanceCount);
                     if(count == 0)
-                        _hostControl.Stop();
+                        Task.Factory.StartNew(() => _hostControl.Stop());
                 }, false);
 
             _clientTasks.Add(composer.Finish());
