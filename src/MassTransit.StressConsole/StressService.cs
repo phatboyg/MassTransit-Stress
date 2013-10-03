@@ -2,6 +2,7 @@
 {
     using System;
     using System.Collections.Generic;
+    using System.Diagnostics;
     using System.Linq;
     using System.Threading;
     using System.Threading.Tasks;
@@ -31,15 +32,29 @@
         int _requestCount;
         int _instanceCount;
         int[][] _timings;
+        long _totalTime;
+        Stopwatch _generatorStartTime;
 
         public StressService(Uri serviceBusUri, string username, string password, ushort heartbeat, int iterations, int instances)
         {
             _username = username;
-            _serviceBusUri = serviceBusUri;
             _password = password;
             _heartbeat = heartbeat;
             _iterations = iterations;
             _instances = instances;
+            _serviceBusUri = serviceBusUri;
+            if (_serviceBusUri.Query.IndexOf("prefetch", StringComparison.InvariantCultureIgnoreCase) < 0)
+            {
+                var builder = new UriBuilder(_serviceBusUri);
+                if (string.IsNullOrEmpty(builder.Query))
+                    builder.Query = string.Format("prefetch={0}", _instances);
+                else
+                {
+                    builder.Query += string.Format("prefetch={0}", _instances);
+                }
+
+                _serviceBusUri = builder.Uri;
+            }
             _cancel = new CancellationTokenSource();
             _clientTasks = new List<Task>();
         }
@@ -63,6 +78,7 @@
                         });
 
                     x.ReceiveFrom(_serviceBusUri);
+                    x.SetConcurrentConsumerLimit(_instances);
 
                     x.Subscribe(s => s.Handler<StressfulRequest>((context, message) =>
                     {
@@ -71,6 +87,7 @@
 
                 });
 
+            _generatorStartTime = Stopwatch.StartNew();
             StartStressGenerators();
 
             return true;
@@ -81,6 +98,8 @@
             var wait = Task.WaitAll(_clientTasks.ToArray(), (_iterations * _instances / 100).Seconds());
             if (wait)
             {
+                _generatorStartTime.Stop();
+
                 _log.InfoFormat("Stress completed");
                 _log.InfoFormat("Request Count: {0}", _requestCount);
                 _log.InfoFormat("Response Count: {0}", _responseCount);
@@ -90,6 +109,11 @@
                 _log.InfoFormat("Min Response Time: {0}ms", _timings.SelectMany(x => x).Min());
                 _log.InfoFormat("Med Response Time: {0}ms", (int?)_timings.SelectMany(x => x).Median());
                 _log.InfoFormat("95% Response Time: {0}ms", (int?)_timings.SelectMany(x => x).Percentile(95));
+
+                _log.InfoFormat("Elapsed Test Time: {0}", _generatorStartTime.Elapsed);
+                _log.InfoFormat("Total Client Time: {0}ms", _totalTime);
+                _log.InfoFormat("Per Client Time: {0}ms", _totalTime / _instances);
+                _log.InfoFormat("Message Throughput: {0}m/s", (_requestCount + _responseCount) * 1000 / (_totalTime / _instances));
             }
 
             _cancel.Cancel();
@@ -147,6 +171,10 @@
                         });
                 }, false);
 
+            Stopwatch clientTimer = null;
+
+            composer.Execute(() => clientTimer = Stopwatch.StartNew());
+
             composer.Execute(() =>
                 {
                     var task = composer.Compose(x =>
@@ -179,6 +207,7 @@
                     return task;
                 });
 
+            composer.Execute(() => clientTimer.Stop());
 
             composer.Execute(() => bus.Dispose(), false);
 
@@ -189,6 +218,7 @@
 
             composer.Finally(status =>
                 {
+                    Interlocked.Add(ref _totalTime, clientTimer.ElapsedMilliseconds);
                     var count = Interlocked.Decrement(ref _instanceCount);
                     if(count == 0)
                         Task.Factory.StartNew(() => _hostControl.Stop());

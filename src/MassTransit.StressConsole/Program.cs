@@ -14,7 +14,7 @@
 
             string username = "guest";
             string password = "guest";
-            var serviceBusUri = new Uri("rabbitmq://localhost/stress_service?prefetch=32");
+            var serviceBusUri = new Uri("rabbitmq://localhost/stress_service");
             ushort heartbeat = 3;
             int iterations = 1000;
             int instances = 10;
