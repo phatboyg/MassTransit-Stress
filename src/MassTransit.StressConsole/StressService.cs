@@ -4,6 +4,7 @@
     using System.Collections.Generic;
     using System.Diagnostics;
     using System.Linq;
+    using System.Text.RegularExpressions;
     using System.Threading;
     using System.Threading.Tasks;
     using Magnum.Extensions;
@@ -16,26 +17,27 @@
     class StressService :
         ServiceControl
     {
+        readonly CancellationTokenSource _cancel;
         readonly ushort _heartbeat;
+        readonly int _instances;
+        readonly int _iterations;
         readonly LogWriter _log = HostLogger.Get<StressService>();
         readonly string _password;
         readonly Uri _serviceBusUri;
         readonly string _username;
-        readonly CancellationTokenSource _cancel;
-        HostControl _hostControl;
-        IServiceBus _serviceBus;
         IList<Task> _clientTasks;
-        readonly int _iterations;
-        readonly int _instances;
+        Stopwatch _generatorStartTime;
+        HostControl _hostControl;
+        int _instanceCount;
+        int _requestCount;
         int _responseCount;
         long _responseTime;
-        int _requestCount;
-        int _instanceCount;
+        IServiceBus _serviceBus;
         int[][] _timings;
         long _totalTime;
-        Stopwatch _generatorStartTime;
 
-        public StressService(Uri serviceBusUri, string username, string password, ushort heartbeat, int iterations, int instances)
+        public StressService(Uri serviceBusUri, string username, string password, ushort heartbeat, int iterations,
+            int instances)
         {
             _username = username;
             _password = password;
@@ -43,18 +45,21 @@
             _iterations = iterations;
             _instances = instances;
             _serviceBusUri = serviceBusUri;
-            if (_serviceBusUri.Query.IndexOf("prefetch", StringComparison.InvariantCultureIgnoreCase) < 0)
-            {
-                var builder = new UriBuilder(_serviceBusUri);
-                if (string.IsNullOrEmpty(builder.Query))
-                    builder.Query = string.Format("prefetch={0}", _instances);
-                else
-                {
-                    builder.Query += string.Format("prefetch={0}", _instances);
-                }
 
-                _serviceBusUri = builder.Uri;
-            }
+            var prefetch = new Regex(@"([\?\&])prefetch=[^\&]+[\&]?");
+            string query = _serviceBusUri.Query;
+
+            if (query.IndexOf("prefetch", StringComparison.InvariantCultureIgnoreCase) >= 0)
+                query = prefetch.Replace(query, string.Format("prefetch={0}", _instances));
+            else if (string.IsNullOrEmpty(query))
+                query = string.Format("prefetch={0}", _instances);
+            else
+                query += string.Format("&prefetch={0}", _instances);
+
+            var builder = new UriBuilder(_serviceBusUri);
+            builder.Query = query.Trim('?');
+            _serviceBusUri = builder.Uri;
+
             _cancel = new CancellationTokenSource();
             _clientTasks = new List<Task>();
         }
@@ -80,11 +85,10 @@
                     x.ReceiveFrom(_serviceBusUri);
                     x.SetConcurrentConsumerLimit(_instances);
 
-                    x.Subscribe(s => s.Handler<StressfulRequest>((context, message) =>
-                    {
-                        context.Respond(new StressfulResponseMessage(message.RequestId));
-                    }));
-
+                    x.Subscribe(
+                        s =>
+                        s.Handler<StressfulRequest>(
+                            (context, message) => { context.Respond(new StressfulResponseMessage(message.RequestId)); }));
                 });
 
             _generatorStartTime = Stopwatch.StartNew();
@@ -95,7 +99,7 @@
 
         public bool Stop(HostControl hostControl)
         {
-            var wait = Task.WaitAll(_clientTasks.ToArray(), (_iterations * _instances / 100).Seconds());
+            bool wait = Task.WaitAll(_clientTasks.ToArray(), (_iterations * _instances / 100).Seconds());
             if (wait)
             {
                 _generatorStartTime.Stop();
@@ -113,7 +117,8 @@
                 _log.InfoFormat("Elapsed Test Time: {0}", _generatorStartTime.Elapsed);
                 _log.InfoFormat("Total Client Time: {0}ms", _totalTime);
                 _log.InfoFormat("Per Client Time: {0}ms", _totalTime / _instances);
-                _log.InfoFormat("Message Throughput: {0}m/s", (_requestCount + _responseCount) * 1000 / (_totalTime / _instances));
+                _log.InfoFormat("Message Throughput: {0}m/s",
+                    (_requestCount + _responseCount) * 1000 / (_totalTime / _instances));
             }
 
             _cancel.Cancel();
@@ -142,13 +147,15 @@
             var composer = new TaskComposer<bool>(_cancel.Token, false);
 
             var endpointAddress = _serviceBus.Endpoint.Address as IRabbitMqEndpointAddress;
-            var queueName = string.Format("{0}_client_{1}", endpointAddress.Name, instance);
-            Uri address = RabbitMqEndpointAddress.Parse(_serviceBusUri).ForQueue(queueName).Uri;
+            string queueName = string.Format("{0}_client_{1}", endpointAddress.Name, instance);
+            var uri = RabbitMqEndpointAddress.Parse(_serviceBusUri).ForQueue(queueName).Uri;
 
-            composer.Execute(() =>
-                {
-                    Interlocked.Increment(ref _instanceCount);
-                });
+            var uriBuilder = new UriBuilder(uri);
+            uriBuilder.Query = _serviceBusUri.Query.Trim('?');
+
+            Uri address = uriBuilder.Uri;
+
+            composer.Execute(() => { Interlocked.Increment(ref _instanceCount); });
 
             IServiceBus bus = null;
             composer.Execute(() =>
@@ -177,7 +184,7 @@
 
             composer.Execute(() =>
                 {
-                    var task = composer.Compose(x =>
+                    Task task = composer.Compose(x =>
                         {
                             for (int i = 0; i < _iterations; i++)
                             {
@@ -185,17 +192,21 @@
                                 x.Execute(() =>
                                     {
                                         var requestMessage = new StressfulRequestMessage();
-                                        var taskRequest = bus.PublishRequestAsync<StressfulRequest>(requestMessage, r => 
-                                        { 
-                                            r.Handle<StressfulResponse>(response=>
+                                        ITaskRequest<StressfulRequest> taskRequest =
+                                            bus.PublishRequestAsync<StressfulRequest>(requestMessage, r =>
                                                 {
-                                                    Interlocked.Increment(ref _responseCount);
+                                                    r.Handle<StressfulResponse>(response =>
+                                                        {
+                                                            Interlocked.Increment(ref _responseCount);
 
-                                                    var timeSpan = response.Timestamp - requestMessage.Timestamp;
-                                                    Interlocked.Add(ref _responseTime, (long)timeSpan.TotalMilliseconds);
-                                                    _timings[instance][iteration] = (int)timeSpan.TotalMilliseconds;
-                                                }); 
-                                        });
+                                                            TimeSpan timeSpan = response.Timestamp
+                                                                                - requestMessage.Timestamp;
+                                                            Interlocked.Add(ref _responseTime,
+                                                                (long)timeSpan.TotalMilliseconds);
+                                                            _timings[instance][iteration] =
+                                                                (int)timeSpan.TotalMilliseconds;
+                                                        });
+                                                });
 
                                         Interlocked.Increment(ref _requestCount);
 
@@ -211,16 +222,13 @@
 
             composer.Execute(() => bus.Dispose(), false);
 
-            composer.Compensate(compensation =>
-                {
-                    return compensation.Handled();
-                });
+            composer.Compensate(compensation => { return compensation.Handled(); });
 
             composer.Finally(status =>
                 {
                     Interlocked.Add(ref _totalTime, clientTimer.ElapsedMilliseconds);
-                    var count = Interlocked.Decrement(ref _instanceCount);
-                    if(count == 0)
+                    int count = Interlocked.Decrement(ref _instanceCount);
+                    if (count == 0)
                         Task.Factory.StartNew(() => _hostControl.Stop());
                 }, false);
 
@@ -228,7 +236,7 @@
         }
 
 
-        class StressfulRequestMessage : 
+        class StressfulRequestMessage :
             StressfulRequest
         {
             public StressfulRequestMessage()
