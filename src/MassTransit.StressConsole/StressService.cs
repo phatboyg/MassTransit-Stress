@@ -19,7 +19,8 @@
         readonly ushort _heartbeat;
         readonly LogWriter _log = HostLogger.Get<StressService>();
         readonly string _password;
-        readonly Uri _serviceBusUri;
+        readonly Uri _hostUri;
+        readonly Uri _receiveUri;
         readonly string _username;
         readonly CancellationTokenSource _cancel;
         HostControl _hostControl;
@@ -35,17 +36,17 @@
         long _totalTime;
         Stopwatch _generatorStartTime;
 
-        public StressService(Uri serviceBusUri, string username, string password, ushort heartbeat, int iterations, int instances)
+        public StressService(Uri hostUri, string username, string password, ushort heartbeat, int iterations, int instances)
         {
             _username = username;
             _password = password;
             _heartbeat = heartbeat;
             _iterations = iterations;
             _instances = instances;
-            _serviceBusUri = serviceBusUri;
-            if (_serviceBusUri.Query.IndexOf("prefetch", StringComparison.InvariantCultureIgnoreCase) < 0)
+            _hostUri = hostUri;
+            if (_hostUri.Query.IndexOf("prefetch", StringComparison.InvariantCultureIgnoreCase) < 0)
             {
-                var builder = new UriBuilder(_serviceBusUri);
+                var builder = new UriBuilder(_hostUri);
                 if (string.IsNullOrEmpty(builder.Query))
                     builder.Query = string.Format("prefetch={0}", _instances);
                 else
@@ -53,23 +54,28 @@
                     builder.Query += string.Format("prefetch={0}", _instances);
                 }
 
-                _serviceBusUri = builder.Uri;
+                _hostUri = builder.Uri;
             }
             _cancel = new CancellationTokenSource();
             _clientTasks = new List<Task>();
+
+            var receiveBuilder = new UriBuilder(_hostUri);
+            receiveBuilder.UserName = _username;
+            receiveBuilder.Password = _password;
+            _receiveUri = receiveBuilder.Uri;
         }
 
         public bool Start(HostControl hostControl)
         {
             _hostControl = hostControl;
 
-            _log.InfoFormat("Creating service bus at {0}", _serviceBusUri);
+            _log.InfoFormat("Creating service bus at {0}", _hostUri);
 
             _serviceBus = ServiceBusFactory.New(x =>
                 {
                     x.UseRabbitMq(r =>
                         {
-                            r.ConfigureHost(_serviceBusUri, h =>
+                            r.ConfigureHost(_hostUri, h =>
                                 {
                                     h.SetUsername(_username);
                                     h.SetPassword(_password);
@@ -77,7 +83,7 @@
                                 });
                         });
 
-                    x.ReceiveFrom(_serviceBusUri);
+                    x.ReceiveFrom(_receiveUri);
                     x.SetConcurrentConsumerLimit(_instances);
 
                     x.Subscribe(s => s.Handler<StressfulRequest>((context, message) =>
@@ -143,7 +149,7 @@
 
             var endpointAddress = _serviceBus.Endpoint.Address as IRabbitMqEndpointAddress;
             var queueName = string.Format("{0}_client_{1}", endpointAddress.Name, instance);
-            Uri address = RabbitMqEndpointAddress.Parse(_serviceBusUri).ForQueue(queueName).Uri;
+            Uri address = RabbitMqEndpointAddress.Parse(_hostUri).ForQueue(queueName).Uri;
 
             composer.Execute(() =>
                 {
