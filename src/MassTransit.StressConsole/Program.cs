@@ -18,6 +18,9 @@
             ushort heartbeat = 3;
             int iterations = 1000;
             int instances = 10;
+            int messageSize = 128;
+            bool cleanup = true;
+            bool mixed = false;
 
             int workerThreads;
             int completionPortThreads;
@@ -36,9 +39,13 @@
                     x.AddCommandLineDefinition("heartbeat", v => heartbeat = ushort.Parse(v));
                     x.AddCommandLineDefinition("iterations", v => iterations = int.Parse(v));
                     x.AddCommandLineDefinition("instances", v => instances = int.Parse(v));
+                    x.AddCommandLineDefinition("size", v => messageSize = int.Parse(v));
+                    x.AddCommandLineDefinition("cleanup", v => cleanup = bool.Parse(v));
+                    x.AddCommandLineDefinition("mixed", v => mixed = bool.Parse(v));
                     x.ApplyCommandLine();
 
-                    x.Service(hostSettings => new StressService(serviceBusUri, username, password, heartbeat, iterations, instances));
+                    x.Service(hostSettings => new StressService(serviceBusUri, username, password, heartbeat,
+                                                  iterations, instances, messageSize, cleanup, mixed));
                 });
         }
     }

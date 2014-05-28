@@ -8,6 +8,8 @@
     using System.Threading;
     using System.Threading.Tasks;
     using Magnum.Extensions;
+    using RabbitMQ.Client;
+    using RabbitMQ.Client.Exceptions;
     using Taskell;
     using Topshelf;
     using Topshelf.Logging;
@@ -22,6 +24,9 @@
         readonly int _instances;
         readonly int _iterations;
         readonly LogWriter _log = HostLogger.Get<StressService>();
+        readonly int _messageSize;
+        readonly bool _cleanUp;
+        readonly bool _mixed;
         readonly string _password;
         readonly Uri _serviceBusUri;
         readonly string _username;
@@ -35,16 +40,20 @@
         IServiceBus _serviceBus;
         int[][] _timings;
         long _totalTime;
+        readonly string _messageContent;
 
-        public StressService(Uri serviceBusUri, string username, string password, ushort heartbeat, int iterations,
-            int instances)
+        public StressService(Uri serviceBusUri, string username, string password, ushort heartbeat, int iterations, int instances, int messageSize, bool cleanUp, bool mixed)
         {
             _username = username;
             _password = password;
             _heartbeat = heartbeat;
             _iterations = iterations;
             _instances = instances;
+            _messageSize = messageSize;
+            _cleanUp = cleanUp;
+            _mixed = mixed;
             _serviceBusUri = serviceBusUri;
+            _messageContent = new string('*', messageSize);
 
             var prefetch = new Regex(@"([\?\&])prefetch=[^\&]+[\&]?");
             string query = _serviceBusUri.Query;
@@ -68,6 +77,9 @@
         {
             _hostControl = hostControl;
 
+            _log.InfoFormat("Running {0} iterations with {1} client instances", _iterations, _instances);
+            _log.InfoFormat("Using a content size of {0} bytes", _messageSize);
+
             _log.InfoFormat("Creating service bus at {0}", _serviceBusUri);
 
             _serviceBus = ServiceBusFactory.New(x =>
@@ -85,10 +97,11 @@
                     x.ReceiveFrom(_serviceBusUri);
                     x.SetConcurrentConsumerLimit(_instances);
 
-                    x.Subscribe(
-                        s =>
-                        s.Handler<StressfulRequest>(
-                            (context, message) => { context.Respond(new StressfulResponseMessage(message.RequestId)); }));
+                    x.Subscribe(s => s.Handler<StressfulRequest>((context, message) =>
+                        {
+                            // just respond with the Id
+                            context.Respond(new StressfulResponseMessage(message.RequestId));
+                        }));
                 });
 
             _generatorStartTime = Stopwatch.StartNew();
@@ -119,6 +132,8 @@
                 _log.InfoFormat("Per Client Time: {0}ms", _totalTime / _instances);
                 _log.InfoFormat("Message Throughput: {0}m/s",
                     (_requestCount + _responseCount) * 1000 / (_totalTime / _instances));
+
+                DrawResponseTimeGraph();
             }
 
             _cancel.Cancel();
@@ -129,7 +144,74 @@
                 _serviceBus = null;
             }
 
+            if (_cleanUp)
+            {
+                CleanUpQueuesAndExchanges();
+            }
+
             return wait;
+        }
+
+        void CleanUpQueuesAndExchanges()
+        {
+            var address = RabbitMqEndpointAddress.Parse(_serviceBusUri);
+            var connectionFactory = address.ConnectionFactory;
+            if (string.IsNullOrWhiteSpace(connectionFactory.UserName))
+                connectionFactory.UserName = "guest";
+            if (string.IsNullOrWhiteSpace(connectionFactory.Password))
+                connectionFactory.Password = "guest";
+
+            using (var connection = connectionFactory.CreateConnection())
+            {
+                using (var model = connection.CreateModel())
+                {
+                    model.ExchangeDelete(address.Name);
+                    model.QueueDelete(address.Name);
+
+                    for (int i = 0; i < 10000; i++)
+                    {
+                        string name = string.Format("{0}_client_{1}", address.Name, i);
+                        try
+                        {
+                            model.QueueDeclarePassive(name);
+                        }
+                        catch (OperationInterruptedException)
+                        {
+                            break;
+                        }
+
+                        model.ExchangeDelete(name);
+                        model.QueueDelete(name);
+                    }
+                }
+            }
+        }
+
+        void DrawResponseTimeGraph()
+        {
+            var maxTime = _timings.SelectMany(x => x).Max();
+            var minTime = _timings.SelectMany(x => x).Min();
+
+            const int segments = 10;
+
+            var span = maxTime - minTime;
+            var increment = span / segments;
+
+            var histogram = (from x in _timings.SelectMany(x => x)
+                        let key = ((x - minTime) * segments / span)
+                        where key >= 0 && key < segments
+                        let groupKey = key
+                        group x by groupKey into segment
+                        orderby segment.Key
+                        select new { Value = segment.Key, Count = segment.Count() }).ToList();
+
+            var maxCount = histogram.Max(x => x.Count);
+
+            foreach (var item in histogram)
+            {
+                int barLength = item.Count * 60 / maxCount;
+                _log.InfoFormat("{0,5}ms {2,-60} ({1,7})", minTime + increment * item.Value, item.Count, new string('*', barLength));
+            }
         }
 
         void StartStressGenerators()
@@ -148,7 +230,7 @@
 
             var endpointAddress = _serviceBus.Endpoint.Address as IRabbitMqEndpointAddress;
             string queueName = string.Format("{0}_client_{1}", endpointAddress.Name, instance);
-            var uri = RabbitMqEndpointAddress.Parse(_serviceBusUri).ForQueue(queueName).Uri;
+            Uri uri = RabbitMqEndpointAddress.Parse(_serviceBusUri).ForQueue(queueName).Uri;
 
             var uriBuilder = new UriBuilder(uri);
             uriBuilder.Query = _serviceBusUri.Query.Trim('?');
@@ -191,7 +273,8 @@
                                 int iteration = i;
                                 x.Execute(() =>
                                     {
-                                        var requestMessage = new StressfulRequestMessage();
+                                        var messageContent = _mixed && iteration % 2 == 0 ? new string('*', 128) : _messageContent;
+                                        var requestMessage = new StressfulRequestMessage(messageContent);
                                         ITaskRequest<StressfulRequest> taskRequest =
                                             bus.PublishRequestAsync<StressfulRequest>(requestMessage, r =>
                                                 {
@@ -239,14 +322,16 @@
         class StressfulRequestMessage :
             StressfulRequest
         {
-            public StressfulRequestMessage()
+            public StressfulRequestMessage(string content)
             {
                 RequestId = NewId.NextGuid();
                 Timestamp = DateTime.UtcNow;
+                Content = content;
             }
 
             public Guid RequestId { get; private set; }
             public DateTime Timestamp { get; private set; }
+            public string Content { get; private set; }
         }
 
 

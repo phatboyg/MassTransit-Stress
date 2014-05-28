@@ -7,5 +7,6 @@
     {
         Guid RequestId { get; }
         DateTime Timestamp { get; }
+        string Content { get; }
     }
 }
