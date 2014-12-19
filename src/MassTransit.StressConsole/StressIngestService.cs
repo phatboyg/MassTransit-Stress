@@ -4,7 +4,6 @@
     using System.Collections.Generic;
     using System.Diagnostics;
     using System.Linq;
-    using System.Text.RegularExpressions;
     using System.Threading;
     using System.Threading.Tasks;
     using Magnum.Extensions;
@@ -16,15 +15,17 @@
     using Transports.RabbitMq;
 
 
-    class StressService :
+    class StressIngestService :
         ServiceControl
     {
         readonly CancellationTokenSource _cancel;
         readonly bool _cleanUp;
+        readonly Uri _clientUri;
+        readonly int _consumerLimit;
         readonly ushort _heartbeat;
         readonly int _instances;
         readonly int _iterations;
-        readonly LogWriter _log = HostLogger.Get<StressService>();
+        readonly LogWriter _log = HostLogger.Get<StressIngestService>();
         readonly string _messageContent;
         readonly int _messageSize;
         readonly bool _mixed;
@@ -35,17 +36,14 @@
         Stopwatch _generatorStartTime;
         HostControl _hostControl;
         int _instanceCount;
-        int _requestCount;
-        int _responseCount;
-        long _responseTime;
-        IServiceBus _serviceBus;
+        int _sendCount;
+        long _sendTime;
+        RabbitMqEndpointAddress _serviceBusAddress;
         int[][] _timings;
         long _totalTime;
-        int _prefetchCount;
-        int _consumerLimit;
-        Uri _clientUri;
 
-        public StressService(Uri serviceBusUri, string username, string password, ushort heartbeat, int iterations, int instances, int messageSize, bool cleanUp, bool mixed, int prefetchCount, int consumerLimit)
+        public StressIngestService(Uri serviceBusUri, string username, string password, ushort heartbeat, int iterations,
+            int instances, int messageSize, bool cleanUp, bool mixed, int prefetchCount, int consumerLimit)
         {
             _username = username;
             _password = password;
@@ -53,7 +51,6 @@
             _iterations = iterations;
             _instances = instances;
             _messageSize = messageSize;
-            _prefetchCount = prefetchCount;
             _consumerLimit = consumerLimit;
             _cleanUp = cleanUp;
             _mixed = mixed;
@@ -61,20 +58,6 @@
             _messageContent = new string('*', messageSize);
 
             _clientUri = _serviceBusUri;
-
-            var prefetch = new Regex(@"([\?\&])prefetch=[^\&]+[\&]?");
-            string query = _serviceBusUri.Query;
-
-            if (query.IndexOf("prefetch", StringComparison.InvariantCultureIgnoreCase) >= 0)
-                query = prefetch.Replace(query, string.Format("prefetch={0}", _prefetchCount));
-            else if (string.IsNullOrEmpty(query))
-                query = string.Format("prefetch={0}", _prefetchCount);
-            else
-                query += string.Format("&prefetch={0}", _prefetchCount);
-
-            var builder = new UriBuilder(_serviceBusUri);
-            builder.Query = query.Trim('?');
-            _serviceBusUri = builder.Uri;
 
             _cancel = new CancellationTokenSource();
             _clientTasks = new List<Task>();
@@ -84,7 +67,8 @@
         {
             _hostControl = hostControl;
 
-            _log.InfoFormat("RabbitMQ Stress Test (using MassTransit)");
+            _log.InfoFormat("RabbitMQ Ingest Stress Test (using MassTransit)");
+
             _log.InfoFormat("Host: {0}", _serviceBusUri);
             _log.InfoFormat("Username: {0}", _username);
             _log.InfoFormat("Password: {0}", new String('*', _password.Length));
@@ -96,7 +80,7 @@
 
             _log.InfoFormat("Creating {0}", _serviceBusUri);
 
-            _serviceBus = ServiceBusFactory.New(x =>
+            IServiceBus serviceBus = ServiceBusFactory.New(x =>
             {
                 x.UseRabbitMq(r =>
                 {
@@ -117,6 +101,10 @@
                     context.Respond(new StressfulResponseMessage(message.RequestId));
                 }));
             });
+            _serviceBusAddress = serviceBus.Endpoint.Address as RabbitMqEndpointAddress;
+            serviceBus.Dispose();
+
+            // this just ensures the queues are setup right
 
             _generatorStartTime = Stopwatch.StartNew();
             StartStressGenerators().Wait(_cancel.Token);
@@ -132,31 +120,28 @@
                 _generatorStartTime.Stop();
 
                 _log.InfoFormat("RabbitMQ Stress Test Completed");
-                _log.InfoFormat("Request Count: {0}", _requestCount);
-                _log.InfoFormat("Response Count: {0}", _responseCount);
-                _log.InfoFormat("Average Resp Time: {0}ms", _responseTime / _responseCount);
+                _log.InfoFormat("Send Count: {0}", _sendCount);
+                _log.InfoFormat("Average Send Time: {0}ms", TimeSpan.FromTicks(_sendTime).TotalMilliseconds / _sendCount);
 
-                _log.InfoFormat("Max Response Time: {0}ms", _timings.SelectMany(x => x).Max());
-                _log.InfoFormat("Min Response Time: {0}ms", _timings.SelectMany(x => x).Min());
-                _log.InfoFormat("Med Response Time: {0}ms", (int?)_timings.SelectMany(x => x).Median());
-                _log.InfoFormat("95% Response Time: {0}ms", (int?)_timings.SelectMany(x => x).Percentile(95));
+                _log.InfoFormat("Max Response Time: {0}ms", TimeSpan.FromTicks(_timings.SelectMany(x => x).Max()).TotalMilliseconds);
+                _log.InfoFormat("Min Response Time: {0}ms", TimeSpan.FromTicks(_timings.SelectMany(x => x).Min()).TotalMilliseconds);
+                double? median = _timings.SelectMany(x => x).Median();
+                if(median.HasValue)
+                _log.InfoFormat("Med Response Time: {0}ms", TimeSpan.FromTicks((long)median.Value).TotalMilliseconds);
+                double? percentile = _timings.SelectMany(x => x).Percentile(95);
+                if(percentile.HasValue)
+                    _log.InfoFormat("95% Response Time: {0}ms", TimeSpan.FromTicks((long)percentile.Value).TotalMilliseconds);
 
                 _log.InfoFormat("Elapsed Test Time: {0}", _generatorStartTime.Elapsed);
                 _log.InfoFormat("Total Client Time: {0}ms", _totalTime);
                 _log.InfoFormat("Per Client Time: {0}ms", _totalTime / _instances);
                 _log.InfoFormat("Message Throughput: {0}m/s",
-                    (_requestCount + _responseCount) * 1000 / (_totalTime / _instances));
+                    (_sendCount) * 1000 / (_totalTime / _instances));
 
                 DrawResponseTimeGraph();
             }
 
             _cancel.Cancel();
-
-            if (_serviceBus != null)
-            {
-                _serviceBus.Dispose();
-                _serviceBus = null;
-            }
 
             if (_cleanUp)
                 CleanUpQueuesAndExchanges();
@@ -201,15 +186,15 @@
 
         void DrawResponseTimeGraph()
         {
-            int maxTime = _timings.SelectMany(x => x).Max();
-            int minTime = _timings.SelectMany(x => x).Min();
+            int maxTime = _timings.SelectMany(x => x).Select(x => x / 100).Max();
+            int minTime = _timings.SelectMany(x => x).Select(x => x / 100).Min();
 
             const int segments = 10;
 
             int span = maxTime - minTime;
             int increment = span / segments;
 
-            var histogram = (from x in _timings.SelectMany(x => x)
+            var histogram = (from x in _timings.SelectMany(x => x).Select(x => x / 100)
                 let key = ((x - minTime) * segments / span)
                 where key >= 0 && key < segments
                 let groupKey = key
@@ -223,7 +208,7 @@
             foreach (var item in histogram)
             {
                 int barLength = item.Count * 60 / maxCount;
-                _log.InfoFormat("{0,5}ms {2,-60} ({1,7})", minTime + increment * item.Value, item.Count,
+                _log.InfoFormat("{0,5}ms {2,-60} ({1,7})", TimeSpan.FromTicks(minTime * 100 + increment * item.Value * 100).TotalMilliseconds, item.Count,
                     new string('*', barLength));
             }
         }
@@ -251,8 +236,7 @@
 
             var composer = new TaskComposer<bool>(_cancel.Token, false);
 
-            var endpointAddress = _serviceBus.Endpoint.Address as IRabbitMqEndpointAddress;
-            string queueName = string.Format("{0}_client_{1}", endpointAddress.Name, instance);
+            string queueName = string.Format("{0}_client_{1}", _serviceBusAddress.Name, instance);
             Uri uri = RabbitMqEndpointAddress.Parse(_clientUri).ForQueue(queueName).Uri;
 
             var uriBuilder = new UriBuilder(uri);
@@ -261,6 +245,8 @@
             Uri address = uriBuilder.Uri;
 
             composer.Execute(() => { Interlocked.Increment(ref _instanceCount); });
+
+            composer.Execute(async () => { await Task.Yield(); });
 
             IServiceBus bus = null;
             composer.Execute(() =>
@@ -285,10 +271,10 @@
 
             Stopwatch clientTimer = null;
 
-            composer.Execute(() =>
+            composer.Execute(async () =>
             {
                 ready.TrySetResult(true);
-                return start;
+                await start;
             });
 
             composer.Execute(() => clientTimer = Stopwatch.StartNew());
@@ -307,25 +293,16 @@
                                 : _messageContent;
                             var requestMessage = new StressfulRequestMessage(messageContent);
 
-                            ITaskRequest<StressfulRequest> taskRequest =
-                                bus.PublishRequestAsync<StressfulRequest>(requestMessage, r =>
-                                {
-                                    r.Handle<StressfulResponse>(response =>
-                                    {
-                                        Interlocked.Increment(ref _responseCount);
+                            Stopwatch sendTimer = Stopwatch.StartNew();
 
-                                        TimeSpan timeSpan = response.Timestamp
-                                                            - requestMessage.Timestamp;
-                                        Interlocked.Add(ref _responseTime,
-                                            (long)timeSpan.TotalMilliseconds);
-                                        _timings[instance][iteration] =
-                                            (int)timeSpan.TotalMilliseconds;
-                                    });
-                                });
+                            bus.Publish<StressfulRequest>(requestMessage);
 
-                            Interlocked.Increment(ref _requestCount);
+                            sendTimer.Stop();
 
-                            return taskRequest.Task;
+                            Interlocked.Add(ref _sendTime, sendTimer.ElapsedTicks);
+                            _timings[instance][iteration] = (int)sendTimer.ElapsedTicks;
+
+                            Interlocked.Increment(ref _sendCount);
                         });
                     }
                 });

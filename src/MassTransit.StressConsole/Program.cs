@@ -27,9 +27,14 @@
             int iterations = 1000;
             int instances = 10;
             int messageSize = 128;
+            int prefetchCount = 10;
+            int consumerLimit = 10;
+            string test = "stress";
             bool cleanup = true;
             bool mixed = false;
             string debug = null;
+
+
             int workerThreads;
             int completionPortThreads;
             ThreadPool.GetMinThreads(out workerThreads, out completionPortThreads);
@@ -47,6 +52,9 @@
                 x.AddCommandLineDefinition("heartbeat", v => heartbeat = ushort.Parse(v));
                 x.AddCommandLineDefinition("iterations", v => iterations = int.Parse(v));
                 x.AddCommandLineDefinition("instances", v => instances = int.Parse(v));
+                x.AddCommandLineDefinition("prefetch", v => prefetchCount = int.Parse(v));
+                x.AddCommandLineDefinition("threads", v => consumerLimit = int.Parse(v));
+                x.AddCommandLineDefinition("test", v => test = v);
                 x.AddCommandLineDefinition("size", v => messageSize = int.Parse(v));
                 x.AddCommandLineDefinition("cleanup", v => cleanup = bool.Parse(v));
                 x.AddCommandLineDefinition("mixed", v => mixed = bool.Parse(v));
@@ -58,8 +66,15 @@
                     if (!string.IsNullOrWhiteSpace(debug))
                         EnableDebug(debug);
 
-                    return new StressService(serviceBusUri, username, password, heartbeat,
-                        iterations, instances, messageSize, cleanup, mixed);
+                    if (test == "ingest")
+                    {
+                        return new SelectService(new StressIngestService(serviceBusUri, username, password, heartbeat,
+                            iterations, instances, messageSize, cleanup, mixed, prefetchCount, consumerLimit));
+                    }
+
+
+                    return new SelectService(new StressService(serviceBusUri, username, password, heartbeat,
+                        iterations, instances, messageSize, cleanup, mixed, prefetchCount, consumerLimit));
                 });
             });
         }
