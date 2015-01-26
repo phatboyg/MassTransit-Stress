@@ -10,10 +10,11 @@
     using Magnum.Extensions;
     using RabbitMQ.Client;
     using RabbitMQ.Client.Exceptions;
+    using RabbitMqTransport;
+    using RabbitMqTransport.Configuration;
     using Taskell;
     using Topshelf;
     using Topshelf.Logging;
-    using Transports.RabbitMq;
 
 
     class StressService :
@@ -32,9 +33,9 @@
         readonly Uri _serviceBusUri;
         readonly string _username;
         IList<Task> _clientTasks;
-        Uri _clientUri;
         int _consumerLimit;
         readonly int _requestsPerInstance;
+        readonly string _queueName;
         Stopwatch _generatorStartTime;
         HostControl _hostControl;
         int _instanceCount;
@@ -43,11 +44,13 @@
         int _responseCount;
         int _mismatchedResponseCount;
         long _responseTime;
-        IServiceBus _serviceBus;
+        IBusControl _serviceBus;
         int[][] _timings;
         long _totalTime;
+        BusHandle _busHandle;
+        Uri _clientUri;
 
-        public StressService(Uri serviceBusUri, string username, string password, ushort heartbeat, int iterations, int instances, int messageSize, bool cleanUp, bool mixed, int prefetchCount, int consumerLimit, int requestsPerInstance)
+        public StressService(Uri serviceBusUri, string username, string password, ushort heartbeat, int iterations, int instances, int messageSize, bool cleanUp, bool mixed, int prefetchCount, int consumerLimit, int requestsPerInstance, string queueName)
         {
             _username = username;
             _password = password;
@@ -58,26 +61,11 @@
             _prefetchCount = prefetchCount;
             _consumerLimit = consumerLimit;
             _requestsPerInstance = requestsPerInstance;
+            _queueName = queueName;
             _cleanUp = cleanUp;
             _mixed = mixed;
             _serviceBusUri = serviceBusUri;
             _messageContent = new string('*', messageSize);
-
-            _clientUri = _serviceBusUri;
-
-            var prefetch = new Regex(@"([\?\&])prefetch=[^\&]+[\&]?");
-            string query = _serviceBusUri.Query;
-
-            if (query.IndexOf("prefetch", StringComparison.InvariantCultureIgnoreCase) >= 0)
-                query = prefetch.Replace(query, string.Format("prefetch={0}", _prefetchCount));
-            else if (string.IsNullOrEmpty(query))
-                query = string.Format("prefetch={0}", _prefetchCount);
-            else
-                query += string.Format("&prefetch={0}", _prefetchCount);
-
-            var builder = new UriBuilder(_serviceBusUri);
-            builder.Query = query.Trim('?');
-            _serviceBusUri = builder.Uri;
 
             _cancel = new CancellationTokenSource();
             _clientTasks = new List<Task>();
@@ -106,32 +94,54 @@
 
             _log.InfoFormat("Setting minimum thread count: {0}", threads);
 
-            _log.InfoFormat("Creating {0}", _serviceBusUri);
+            _clientUri = new Uri(_serviceBusUri + "/" + _queueName);
 
-            _serviceBus = ServiceBusFactory.New(x =>
+            _log.InfoFormat("Creating {0}", _clientUri);
+
+            long counter = 0;
+            long expected = _requestsPerInstance * _instances * _iterations;
+            Stopwatch handlerTimer = null;
+            _serviceBus = Bus.Factory.CreateUsingRabbitMq(x =>
             {
-                x.UseRabbitMq(r =>
-                {
-                    r.ConfigureHost(_serviceBusUri, h =>
+                var host = x.Host(_serviceBusUri, h =>
                     {
-                        h.SetUsername(_username);
-                        h.SetPassword(_password);
-                        h.SetRequestedHeartbeat(_heartbeat);
+                        h.Username(_username);
+                        h.Password(_password);
+                        h.Heartbeat(_heartbeat);
+                    });
+
+                x.ReceiveEndpoint(host, _queueName, endpoint =>
+                {
+                    endpoint.PrefetchCount = (ushort)_consumerLimit;
+                    endpoint.Handler<StressfulRequest>(context =>
+                    {
+                        if (handlerTimer == null)
+                            handlerTimer = Stopwatch.StartNew();
+
+                        counter++;
+                        if (counter % 100 == 0)
+                        {
+                            Console.SetCursorPosition(0, Console.CursorTop);
+                            Console.Write("{0} / {1} ({2}/second)", counter, expected, (counter * 1000) / handlerTimer.ElapsedMilliseconds);
+                        }
+
+                        // just respond with the Id
+                        return context.RespondAsync(new StressfulResponseMessage(context.Message.RequestId));
                     });
                 });
-
-                x.ReceiveFrom(_serviceBusUri);
-                x.SetConcurrentConsumerLimit(_consumerLimit);
-
-                x.Subscribe(s => s.Handler<StressfulRequest>((context, message) =>
-                {
-                    // just respond with the Id
-                    context.Respond(new StressfulResponseMessage(message.RequestId));
-                }));
             });
 
+            var start = _serviceBus.Start();
+            start.Wait(_cancel.Token);
+
+            _busHandle = start.Result;
+
+            _log.InfoFormat("Started: {0}", _serviceBus.Address);
+
+            hostControl.RequestAdditionalTime(TimeSpan.FromSeconds(30));
+
             _generatorStartTime = Stopwatch.StartNew();
-            StartStressGenerators().Wait(_cancel.Token);
+            StartStressGenerators(hostControl).Wait(_cancel.Token);
 
             return true;
         }
@@ -170,10 +180,9 @@
 
             _cancel.Cancel();
 
-            if (_serviceBus != null)
+            if (_busHandle != null)
             {
-                _serviceBus.Dispose();
-                _serviceBus = null;
+                _busHandle.Stop().Wait();
             }
 
             if (_cleanUp)
@@ -184,8 +193,9 @@
 
         void CleanUpQueuesAndExchanges()
         {
-            RabbitMqEndpointAddress address = RabbitMqEndpointAddress.Parse(_serviceBusUri);
-            ConnectionFactory connectionFactory = address.ConnectionFactory;
+            RabbitMqHostSettings hostSettings = _serviceBusUri.GetHostSettings();
+            ConnectionFactory connectionFactory = hostSettings.GetConnectionFactory();
+
             if (string.IsNullOrWhiteSpace(connectionFactory.UserName))
                 connectionFactory.UserName = "guest";
             if (string.IsNullOrWhiteSpace(connectionFactory.Password))
@@ -195,24 +205,8 @@
             {
                 using (IModel model = connection.CreateModel())
                 {
-                    model.ExchangeDelete(address.Name);
-                    model.QueueDelete(address.Name);
-
-                    for (int i = 0; i < 10000; i++)
-                    {
-                        string name = string.Format("{0}_client_{1}", address.Name, i);
-                        try
-                        {
-                            model.QueueDeclarePassive(name);
-                        }
-                        catch (OperationInterruptedException)
-                        {
-                            break;
-                        }
-
-                        model.ExchangeDelete(name);
-                        model.QueueDelete(name);
-                    }
+                    model.ExchangeDelete(_queueName);
+                    model.QueueDelete(_queueName);
                 }
             }
         }
@@ -246,7 +240,7 @@
             }
         }
 
-        async Task StartStressGenerators()
+        async Task StartStressGenerators(HostControl hostControl)
         {
             var start = new TaskCompletionSource<bool>();
 
@@ -256,6 +250,8 @@
             {
                 _timings[i] = new int[_requestsPerInstance * _iterations];
                 starting.Add(StartStressGenerator(i, start.Task));
+
+                hostControl.RequestAdditionalTime(TimeSpan.FromSeconds(30));
             }
 
             await Task.WhenAll(starting.ToArray());
@@ -269,36 +265,31 @@
 
             var composer = new TaskComposer<bool>(_cancel.Token, false);
 
-            var endpointAddress = _serviceBus.Endpoint.Address as IRabbitMqEndpointAddress;
-            string queueName = string.Format("{0}_client_{1}", endpointAddress.Name, instance);
-            Uri uri = RabbitMqEndpointAddress.Parse(_clientUri).ForQueue(queueName).Uri;
-
-            var uriBuilder = new UriBuilder(uri);
-            uriBuilder.Query = _clientUri.Query.Trim('?');
-
-            Uri address = uriBuilder.Uri;
-
             composer.Execute(() => { Interlocked.Increment(ref _instanceCount); });
 
-            IServiceBus bus = null;
+            IBusControl bus = null;
+            BusHandle busHandle = null;
             composer.Execute(() =>
             {
-                _log.InfoFormat("Creating {0}", address);
-
-                bus = ServiceBusFactory.New(x =>
+                _log.InfoFormat("Creating client {0}", instance);
+                
+                bus = Bus.Factory.CreateUsingRabbitMq(x =>
                 {
-                    x.UseRabbitMq(r =>
+                    x.Host(_serviceBusUri, h =>
                     {
-                        r.ConfigureHost(address, h =>
-                        {
-                            h.SetUsername(_username);
-                            h.SetPassword(_password);
-                            h.SetRequestedHeartbeat(_heartbeat);
-                        });
+                        h.Username(_username);
+                        h.Password(_password);
+                        h.Heartbeat(_heartbeat);
                     });
-
-                    x.ReceiveFrom(address);
                 });
+
+                var task = bus.Start(composer.CancellationToken);
+                task.Wait(composer.CancellationToken);
+
+                _log.InfoFormat("Created client {0}", bus.Address);
+
+                busHandle = task.Result;
+
             }, false);
 
             Stopwatch clientTimer = null;
@@ -311,12 +302,15 @@
 
             composer.Execute(() => clientTimer = Stopwatch.StartNew());
 
-            for (int requestClient = 0; requestClient < _requestsPerInstance; requestClient++)
+           for (int requestClient = 0; requestClient < _requestsPerInstance; requestClient++)
             {
                 int clientIndex = requestClient;
 
                 composer.Execute(() =>
                 {
+                    IRequestClient<StressfulRequestMessage, StressfulResponseMessage> messageClient =
+                        new MessageRequestClient<StressfulRequestMessage, StressfulResponseMessage>(bus, _clientUri, TimeSpan.FromMinutes(5));
+
                     Task task = composer.Compose(x =>
                     {
                         for (int i = 0; i < _iterations; i++)
@@ -329,12 +323,9 @@
                                     : _messageContent;
                                 var requestMessage = new StressfulRequestMessage(messageContent);
 
-                                ITaskRequest<StressfulRequest> taskRequest =
-                                    bus.PublishRequestAsync<StressfulRequest>(requestMessage, r =>
-                                    {
-                                        r.Handle<StressfulResponse>(response =>
-                                        {
-                                            Interlocked.Increment(ref _responseCount);
+                                var response = messageClient.Request(requestMessage).Result;
+
+                                Interlocked.Increment(ref _responseCount);
 
                                             TimeSpan timeSpan = response.Timestamp - requestMessage.Timestamp;
                                             Interlocked.Add(ref _responseTime, (long)timeSpan.TotalMilliseconds);
@@ -344,12 +335,8 @@
                                             {
                                                 Interlocked.Increment(ref _mismatchedResponseCount);
                                             }
-                                        });
-                                    });
 
                                 Interlocked.Increment(ref _requestCount);
-
-                                return taskRequest.Task;
                             });
                         }
                     });
@@ -360,7 +347,7 @@
 
             composer.Execute(() => clientTimer.Stop());
 
-            composer.Execute(() => bus.Dispose(), false);
+            composer.Execute(() => busHandle.Stop(composer.CancellationToken).Wait(composer.CancellationToken), false);
 
             composer.Compensate(compensation => { return compensation.Handled(); });
 

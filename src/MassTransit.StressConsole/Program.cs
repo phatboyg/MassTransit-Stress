@@ -22,7 +22,8 @@
 
             string username = "guest";
             string password = "guest";
-            var serviceBusUri = new Uri("rabbitmq://localhost/stress_service");
+            var serviceBusUri = new Uri("rabbitmq://localhost/stress");
+            var queueName = "stress_service";
             ushort heartbeat = 3;
             int iterations = 1000;
             int instances = 10;
@@ -50,6 +51,7 @@
                 x.AddCommandLineDefinition("rmqusername", v => username = v);
                 x.AddCommandLineDefinition("rmqpassword", v => password = v);
                 x.AddCommandLineDefinition("uri", v => serviceBusUri = new Uri(v));
+                x.AddCommandLineDefinition("queue", v => queueName = v);
                 x.AddCommandLineDefinition("heartbeat", v => heartbeat = ushort.Parse(v));
                 x.AddCommandLineDefinition("iterations", v => iterations = int.Parse(v));
                 x.AddCommandLineDefinition("instances", v => instances = int.Parse(v));
@@ -68,15 +70,15 @@
                     if (!string.IsNullOrWhiteSpace(debug))
                         EnableDebug(debug);
 
-                    if (test == "ingest")
-                    {
-                        return new SelectService(new StressIngestService(serviceBusUri, username, password, heartbeat,
-                            iterations, instances, messageSize, cleanup, mixed, prefetchCount, consumerLimit));
-                    }
+//                    if (test == "ingest")
+//                    {
+//                        return new SelectService(new StressIngestService(serviceBusUri, username, password, heartbeat,
+//                            iterations, instances, messageSize, cleanup, mixed, prefetchCount, consumerLimit));
+//                    }
 
 
                     return new SelectService(new StressService(serviceBusUri, username, password, heartbeat,
-                        iterations, instances, messageSize, cleanup, mixed, prefetchCount, consumerLimit, requestsPerInstance));
+                        iterations, instances, messageSize, cleanup, mixed, prefetchCount, consumerLimit, requestsPerInstance, queueName));
                 });
             });
         }
