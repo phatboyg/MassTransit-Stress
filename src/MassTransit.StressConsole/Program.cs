@@ -26,6 +26,7 @@
             ushort heartbeat = 3;
             int iterations = 1000;
             int instances = 10;
+            int requestsPerInstance = 1;
             int messageSize = 128;
             int prefetchCount = 10;
             int consumerLimit = 10;
@@ -54,6 +55,7 @@
                 x.AddCommandLineDefinition("instances", v => instances = int.Parse(v));
                 x.AddCommandLineDefinition("prefetch", v => prefetchCount = int.Parse(v));
                 x.AddCommandLineDefinition("threads", v => consumerLimit = int.Parse(v));
+                x.AddCommandLineDefinition("requests", v => requestsPerInstance = int.Parse(v));
                 x.AddCommandLineDefinition("test", v => test = v);
                 x.AddCommandLineDefinition("size", v => messageSize = int.Parse(v));
                 x.AddCommandLineDefinition("cleanup", v => cleanup = bool.Parse(v));
@@ -74,7 +76,7 @@
 
 
                     return new SelectService(new StressService(serviceBusUri, username, password, heartbeat,
-                        iterations, instances, messageSize, cleanup, mixed, prefetchCount, consumerLimit));
+                        iterations, instances, messageSize, cleanup, mixed, prefetchCount, consumerLimit, requestsPerInstance));
                 });
             });
         }

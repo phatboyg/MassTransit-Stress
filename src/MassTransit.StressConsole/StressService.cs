@@ -32,20 +32,22 @@
         readonly Uri _serviceBusUri;
         readonly string _username;
         IList<Task> _clientTasks;
+        Uri _clientUri;
+        int _consumerLimit;
+        readonly int _requestsPerInstance;
         Stopwatch _generatorStartTime;
         HostControl _hostControl;
         int _instanceCount;
+        int _prefetchCount;
         int _requestCount;
         int _responseCount;
+        int _mismatchedResponseCount;
         long _responseTime;
         IServiceBus _serviceBus;
         int[][] _timings;
         long _totalTime;
-        int _prefetchCount;
-        int _consumerLimit;
-        Uri _clientUri;
 
-        public StressService(Uri serviceBusUri, string username, string password, ushort heartbeat, int iterations, int instances, int messageSize, bool cleanUp, bool mixed, int prefetchCount, int consumerLimit)
+        public StressService(Uri serviceBusUri, string username, string password, ushort heartbeat, int iterations, int instances, int messageSize, bool cleanUp, bool mixed, int prefetchCount, int consumerLimit, int requestsPerInstance)
         {
             _username = username;
             _password = password;
@@ -55,6 +57,7 @@
             _messageSize = messageSize;
             _prefetchCount = prefetchCount;
             _consumerLimit = consumerLimit;
+            _requestsPerInstance = requestsPerInstance;
             _cleanUp = cleanUp;
             _mixed = mixed;
             _serviceBusUri = serviceBusUri;
@@ -91,8 +94,17 @@
             _log.InfoFormat("Message Size: {0} {1}", _messageSize, _mixed ? "(mixed)" : "(fixed)");
             _log.InfoFormat("Iterations: {0}", _iterations);
             _log.InfoFormat("Clients: {0}", _instances);
+            _log.InfoFormat("Requests Per Client: {0}", _requestsPerInstance);
             _log.InfoFormat("Heartbeat: {0}", _heartbeat);
+            _log.InfoFormat("Consumer Limit: {0}", _consumerLimit);
 
+            int workerThreads;
+            int completionPortThreads;
+            ThreadPool.GetMinThreads(out workerThreads, out completionPortThreads);
+            var threads = workerThreads + (_instances * _requestsPerInstance + _consumerLimit);
+            ThreadPool.SetMinThreads(threads, completionPortThreads);
+
+            _log.InfoFormat("Setting minimum thread count: {0}", threads);
 
             _log.InfoFormat("Creating {0}", _serviceBusUri);
 
@@ -134,6 +146,12 @@
                 _log.InfoFormat("RabbitMQ Stress Test Completed");
                 _log.InfoFormat("Request Count: {0}", _requestCount);
                 _log.InfoFormat("Response Count: {0}", _responseCount);
+
+                if (_mismatchedResponseCount > 0)
+                {
+                    _log.ErrorFormat("Mismatched Response Count: {0}", _mismatchedResponseCount);
+                }
+
                 _log.InfoFormat("Average Resp Time: {0}ms", _responseTime / _responseCount);
 
                 _log.InfoFormat("Max Response Time: {0}ms", _timings.SelectMany(x => x).Max());
@@ -236,7 +254,7 @@
             _timings = new int[_instances][];
             for (int i = 0; i < _instances; i++)
             {
-                _timings[i] = new int[_iterations];
+                _timings[i] = new int[_requestsPerInstance * _iterations];
                 starting.Add(StartStressGenerator(i, start.Task));
             }
 
@@ -293,45 +311,52 @@
 
             composer.Execute(() => clientTimer = Stopwatch.StartNew());
 
-            composer.Execute(() =>
+            for (int requestClient = 0; requestClient < _requestsPerInstance; requestClient++)
             {
-                Task task = composer.Compose(x =>
+                int clientIndex = requestClient;
+
+                composer.Execute(() =>
                 {
-                    for (int i = 0; i < _iterations; i++)
+                    Task task = composer.Compose(x =>
                     {
-                        int iteration = i;
-                        x.Execute(() =>
+                        for (int i = 0; i < _iterations; i++)
                         {
-                            string messageContent = _mixed && iteration % 2 == 0
-                                ? new string('*', 128)
-                                : _messageContent;
-                            var requestMessage = new StressfulRequestMessage(messageContent);
+                            int iteration = i;
+                            x.Execute(() =>
+                            {
+                                string messageContent = _mixed && iteration % 2 == 0
+                                    ? new string('*', 128)
+                                    : _messageContent;
+                                var requestMessage = new StressfulRequestMessage(messageContent);
 
-                            ITaskRequest<StressfulRequest> taskRequest =
-                                bus.PublishRequestAsync<StressfulRequest>(requestMessage, r =>
-                                {
-                                    r.Handle<StressfulResponse>(response =>
+                                ITaskRequest<StressfulRequest> taskRequest =
+                                    bus.PublishRequestAsync<StressfulRequest>(requestMessage, r =>
                                     {
-                                        Interlocked.Increment(ref _responseCount);
+                                        r.Handle<StressfulResponse>(response =>
+                                        {
+                                            Interlocked.Increment(ref _responseCount);
 
-                                        TimeSpan timeSpan = response.Timestamp
-                                                            - requestMessage.Timestamp;
-                                        Interlocked.Add(ref _responseTime,
-                                            (long)timeSpan.TotalMilliseconds);
-                                        _timings[instance][iteration] =
-                                            (int)timeSpan.TotalMilliseconds;
+                                            TimeSpan timeSpan = response.Timestamp - requestMessage.Timestamp;
+                                            Interlocked.Add(ref _responseTime, (long)timeSpan.TotalMilliseconds);
+                                            _timings[instance][clientIndex * _iterations + iteration] = (int)timeSpan.TotalMilliseconds;
+
+                                            if (response.RequestId != requestMessage.RequestId)
+                                            {
+                                                Interlocked.Increment(ref _mismatchedResponseCount);
+                                            }
+                                        });
                                     });
-                                });
 
-                            Interlocked.Increment(ref _requestCount);
+                                Interlocked.Increment(ref _requestCount);
 
-                            return taskRequest.Task;
-                        });
-                    }
+                                return taskRequest.Task;
+                            });
+                        }
+                    });
+
+                    return task;
                 });
-
-                return task;
-            });
+            }
 
             composer.Execute(() => clientTimer.Stop());
 
