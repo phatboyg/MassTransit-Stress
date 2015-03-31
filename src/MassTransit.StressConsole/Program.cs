@@ -15,6 +15,7 @@
 
     class Program
     {
+        [MTAThread]
         static int Main()
         {
             Log4NetLogWriterFactory.Use("log4net.config");
@@ -35,6 +36,7 @@
             bool cleanup = true;
             bool mixed = false;
             string debug = null;
+            bool durable = true;
 
 
             int workerThreads;
@@ -60,6 +62,7 @@
                 x.AddCommandLineDefinition("requests", v => requestsPerInstance = int.Parse(v));
                 x.AddCommandLineDefinition("test", v => test = v);
                 x.AddCommandLineDefinition("size", v => messageSize = int.Parse(v));
+                x.AddCommandLineDefinition("durable", v => durable = bool.Parse(v)); 
                 x.AddCommandLineDefinition("cleanup", v => cleanup = bool.Parse(v));
                 x.AddCommandLineDefinition("mixed", v => mixed = bool.Parse(v));
                 x.AddCommandLineDefinition("debug", v => debug = v);
@@ -78,7 +81,7 @@
 
 
                     return new SelectService(new StressService(serviceBusUri, username, password, heartbeat,
-                        iterations, instances, messageSize, cleanup, mixed, prefetchCount, consumerLimit, requestsPerInstance, queueName));
+                        iterations, instances, messageSize, cleanup, mixed, prefetchCount, consumerLimit, requestsPerInstance, queueName, durable));
                 });
             });
         }

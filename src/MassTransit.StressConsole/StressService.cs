@@ -1,6 +1,7 @@
 ﻿namespace MassTransit.StressConsole
 {
     using System;
+    using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.Diagnostics;
     using System.Linq;
@@ -20,6 +21,7 @@
     {
         readonly CancellationTokenSource _cancel;
         readonly bool _cleanUp;
+        readonly bool _durable;
         readonly ushort _heartbeat;
         readonly int _instances;
         readonly int _iterations;
@@ -33,7 +35,7 @@
         readonly Uri _serviceBusUri;
         readonly string _username;
         BusHandle _busHandle;
-        IList<Task> _clientTasks;
+        ConcurrentBag<Task> _clientTasks;
         Uri _clientUri;
         int _consumerLimit;
         Stopwatch _generatorStartTime;
@@ -49,7 +51,7 @@
         long _totalTime;
 
         public StressService(Uri serviceBusUri, string username, string password, ushort heartbeat, int iterations, int instances, int messageSize, bool cleanUp,
-            bool mixed, int prefetchCount, int consumerLimit, int requestsPerInstance, string queueName)
+            bool mixed, int prefetchCount, int consumerLimit, int requestsPerInstance, string queueName, bool durable)
         {
             _username = username;
             _password = password;
@@ -61,13 +63,14 @@
             _consumerLimit = consumerLimit;
             _requestsPerInstance = requestsPerInstance;
             _queueName = queueName;
+            _durable = durable;
             _cleanUp = cleanUp;
             _mixed = mixed;
             _serviceBusUri = serviceBusUri;
             _messageContent = new string('*', messageSize);
 
             _cancel = new CancellationTokenSource();
-            _clientTasks = new List<Task>();
+            _clientTasks = new ConcurrentBag<Task>();
         }
 
         public bool Start(HostControl hostControl)
@@ -83,6 +86,7 @@
             _log.InfoFormat("Clients: {0}", _instances);
             _log.InfoFormat("Requests Per Client: {0}", _requestsPerInstance);
             _log.InfoFormat("Heartbeat: {0}", _heartbeat);
+            _log.InfoFormat("Durable: {0}", _durable);
             _log.InfoFormat("Consumer Limit: {0}", _consumerLimit);
 
             int workerThreads;
@@ -93,13 +97,11 @@
 
             _log.InfoFormat("Setting minimum thread count: {0}", threads);
 
-            _clientUri = new Uri(_serviceBusUri + "/" + _queueName);
+            _clientUri = new Uri(string.Format("{0}/{1}?durable={2}", _serviceBusUri, _queueName, _durable));
 
             _log.InfoFormat("Creating {0}", _clientUri);
 
-            long counter = 0;
-            long expected = _requestsPerInstance * _instances * _iterations;
-            Stopwatch handlerTimer = null;
+            RequestConsumer.Expected = _requestsPerInstance * _instances * _iterations;
             _serviceBus = Bus.Factory.CreateUsingRabbitMq(x =>
             {
                 IRabbitMqHost host = x.Host(_serviceBusUri, h =>
@@ -112,21 +114,8 @@
                 x.ReceiveEndpoint(host, _queueName, endpoint =>
                 {
                     endpoint.PrefetchCount = (ushort)_consumerLimit;
-                    endpoint.Handler<StressfulRequest>(context =>
-                    {
-                        if (handlerTimer == null)
-                            handlerTimer = Stopwatch.StartNew();
-
-                        counter++;
-                        if (counter % 100 == 0)
-                        {
-                            Console.SetCursorPosition(0, Console.CursorTop);
-                            Console.Write("{0} / {1} ({2}/second)", counter, expected, (counter * 1000) / handlerTimer.ElapsedMilliseconds);
-                        }
-
-                        // just respond with the Id
-                        return context.RespondAsync(new StressfulResponseMessage(context.Message.RequestId));
-                    });
+                    endpoint.Durable(_durable);
+                    endpoint.Consumer<RequestConsumer>();
                 });
             });
 
@@ -141,6 +130,40 @@
 
             return true;
         }
+
+
+        class RequestConsumer :
+            IConsumer<StressfulRequestMessage>
+        {
+            static Stopwatch _handlerTimer;
+            static long _counter;
+            static long _expected;
+
+            public static int Expected
+            {
+                set { _expected = value; }
+            }
+
+            public Task Consume(ConsumeContext<StressfulRequestMessage> context)
+            {
+                if (_handlerTimer == null)
+                    _handlerTimer = Stopwatch.StartNew();
+
+                long count = Interlocked.Increment(ref _counter);
+                if (count % 1000 == 0)
+                {
+                    lock (Console.Out)
+                    {
+                        Console.SetCursorPosition(0, Console.CursorTop);
+                        Console.Write("{0} / {1} ({2}/second)", count, _expected, (count * 1000) / _handlerTimer.ElapsedMilliseconds);
+                    }
+                }
+
+                // just respond with the Id
+                return context.RespondAsync(new StressfulResponseMessage(context.Message.RequestId));
+            }
+        }
+
 
         public bool Stop(HostControl hostControl)
         {
@@ -167,7 +190,7 @@
                 _log.InfoFormat("Total Client Time: {0}ms", _totalTime);
                 _log.InfoFormat("Per Client Time: {0}ms", _totalTime / _instances);
                 _log.InfoFormat("Message Throughput: {0}m/s",
-                    ((_requestCount + _responseCount) * 1000) / _totalTime);
+                    ((_requestCount + _responseCount) * 1000) / (_totalTime / _instances));
 
                 DrawResponseTimeGraph();
             }
@@ -290,46 +313,7 @@
 
             composer.Execute(() => clientTimer = Stopwatch.StartNew());
 
-            for (int requestClient = 0; requestClient < _requestsPerInstance; requestClient++)
-            {
-                int clientIndex = requestClient;
-
-                composer.Execute(() =>
-                {
-                    IRequestClient<StressfulRequestMessage, StressfulResponseMessage> messageClient =
-                        new MessageRequestClient<StressfulRequestMessage, StressfulResponseMessage>(bus, _clientUri, TimeSpan.FromMinutes(5));
-
-                    Task task = composer.Compose(x =>
-                    {
-                        for (int i = 0; i < _iterations; i++)
-                        {
-                            int iteration = i;
-                            x.Execute(() =>
-                            {
-                                string messageContent = _mixed && iteration % 2 == 0
-                                    ? new string('*', 128)
-                                    : _messageContent;
-                                var requestMessage = new StressfulRequestMessage(messageContent);
-
-                                StressfulResponseMessage response = messageClient.Request(requestMessage).Result;
-
-                                Interlocked.Increment(ref _responseCount);
-
-                                TimeSpan timeSpan = response.Timestamp - requestMessage.Timestamp;
-                                Interlocked.Add(ref _responseTime, (long)timeSpan.TotalMilliseconds);
-                                _timings[instance][clientIndex * _iterations + iteration] = (int)timeSpan.TotalMilliseconds;
-
-                                if (response.RequestId != requestMessage.RequestId)
-                                    Interlocked.Increment(ref _mismatchedResponseCount);
-
-                                Interlocked.Increment(ref _requestCount);
-                            });
-                        }
-                    });
-
-                    return task;
-                });
-            }
+            composer.Execute(() => Task.WhenAll(Enumerable.Range(0, _requestsPerInstance).Select(x => ClientRequestFunc(bus, instance, x))));
 
             composer.Execute(() => clientTimer.Stop());
 
@@ -348,6 +332,34 @@
             _clientTasks.Add(composer.Finish());
 
             return ready.Task;
+        }
+
+        async Task ClientRequestFunc(IBus bus, int instance, int clientIndex)
+        {
+            IRequestClient<StressfulRequestMessage, StressfulResponseMessage> messageClient =
+                new MessageRequestClient<StressfulRequestMessage, StressfulResponseMessage>(bus, _clientUri, TimeSpan.FromMinutes(5));
+
+            for (int i = 0; i < _iterations; i++)
+            {
+                int iteration = i;
+                string messageContent = _mixed && iteration % 2 == 0
+                    ? new string('*', 128)
+                    : _messageContent;
+                var requestMessage = new StressfulRequestMessage(messageContent);
+
+                Interlocked.Increment(ref _requestCount);
+
+                StressfulResponseMessage response = await messageClient.Request(requestMessage);
+
+                Interlocked.Increment(ref _responseCount);
+
+                TimeSpan timeSpan = response.Timestamp - requestMessage.Timestamp;
+                Interlocked.Add(ref _responseTime, (long)timeSpan.TotalMilliseconds);
+                _timings[instance][clientIndex * _iterations + iteration] = (int)timeSpan.TotalMilliseconds;
+
+                if (response.RequestId != requestMessage.RequestId)
+                    Interlocked.Increment(ref _mismatchedResponseCount);
+            }
         }
 
 
