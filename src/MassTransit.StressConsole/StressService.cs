@@ -4,12 +4,10 @@
     using System.Collections.Generic;
     using System.Diagnostics;
     using System.Linq;
-    using System.Text.RegularExpressions;
     using System.Threading;
     using System.Threading.Tasks;
     using Magnum.Extensions;
     using RabbitMQ.Client;
-    using RabbitMQ.Client.Exceptions;
     using RabbitMqTransport;
     using RabbitMqTransport.Configuration;
     using Taskell;
@@ -30,27 +28,28 @@
         readonly int _messageSize;
         readonly bool _mixed;
         readonly string _password;
+        readonly string _queueName;
+        readonly int _requestsPerInstance;
         readonly Uri _serviceBusUri;
         readonly string _username;
+        BusHandle _busHandle;
         IList<Task> _clientTasks;
+        Uri _clientUri;
         int _consumerLimit;
-        readonly int _requestsPerInstance;
-        readonly string _queueName;
         Stopwatch _generatorStartTime;
         HostControl _hostControl;
         int _instanceCount;
+        int _mismatchedResponseCount;
         int _prefetchCount;
         int _requestCount;
         int _responseCount;
-        int _mismatchedResponseCount;
         long _responseTime;
         IBusControl _serviceBus;
         int[][] _timings;
         long _totalTime;
-        BusHandle _busHandle;
-        Uri _clientUri;
 
-        public StressService(Uri serviceBusUri, string username, string password, ushort heartbeat, int iterations, int instances, int messageSize, bool cleanUp, bool mixed, int prefetchCount, int consumerLimit, int requestsPerInstance, string queueName)
+        public StressService(Uri serviceBusUri, string username, string password, ushort heartbeat, int iterations, int instances, int messageSize, bool cleanUp,
+            bool mixed, int prefetchCount, int consumerLimit, int requestsPerInstance, string queueName)
         {
             _username = username;
             _password = password;
@@ -89,7 +88,7 @@
             int workerThreads;
             int completionPortThreads;
             ThreadPool.GetMinThreads(out workerThreads, out completionPortThreads);
-            var threads = workerThreads + (_instances * _requestsPerInstance + _consumerLimit);
+            int threads = workerThreads + (_instances * _requestsPerInstance + _consumerLimit);
             ThreadPool.SetMinThreads(threads, completionPortThreads);
 
             _log.InfoFormat("Setting minimum thread count: {0}", threads);
@@ -103,12 +102,12 @@
             Stopwatch handlerTimer = null;
             _serviceBus = Bus.Factory.CreateUsingRabbitMq(x =>
             {
-                var host = x.Host(_serviceBusUri, h =>
-                    {
-                        h.Username(_username);
-                        h.Password(_password);
-                        h.Heartbeat(_heartbeat);
-                    });
+                IRabbitMqHost host = x.Host(_serviceBusUri, h =>
+                {
+                    h.Username(_username);
+                    h.Password(_password);
+                    h.Heartbeat(_heartbeat);
+                });
 
                 x.ReceiveEndpoint(host, _queueName, endpoint =>
                 {
@@ -131,10 +130,7 @@
                 });
             });
 
-            var start = _serviceBus.Start();
-            start.Wait(_cancel.Token);
-
-            _busHandle = start.Result;
+            _busHandle = _serviceBus.Start();
 
             _log.InfoFormat("Started: {0}", _serviceBus.Address);
 
@@ -158,9 +154,7 @@
                 _log.InfoFormat("Response Count: {0}", _responseCount);
 
                 if (_mismatchedResponseCount > 0)
-                {
                     _log.ErrorFormat("Mismatched Response Count: {0}", _mismatchedResponseCount);
-                }
 
                 _log.InfoFormat("Average Resp Time: {0}ms", _responseTime / _responseCount);
 
@@ -173,7 +167,7 @@
                 _log.InfoFormat("Total Client Time: {0}ms", _totalTime);
                 _log.InfoFormat("Per Client Time: {0}ms", _totalTime / _instances);
                 _log.InfoFormat("Message Throughput: {0}m/s",
-                    (_requestCount + _responseCount) * 1000 / (_totalTime / _instances));
+                    ((_requestCount + _responseCount) * 1000) / _totalTime);
 
                 DrawResponseTimeGraph();
             }
@@ -181,9 +175,7 @@
             _cancel.Cancel();
 
             if (_busHandle != null)
-            {
                 _busHandle.Stop().Wait();
-            }
 
             if (_cleanUp)
                 CleanUpQueuesAndExchanges();
@@ -272,7 +264,7 @@
             composer.Execute(() =>
             {
                 _log.InfoFormat("Creating client {0}", instance);
-                
+
                 bus = Bus.Factory.CreateUsingRabbitMq(x =>
                 {
                     x.Host(_serviceBusUri, h =>
@@ -283,13 +275,9 @@
                     });
                 });
 
-                var task = bus.Start(composer.CancellationToken);
-                task.Wait(composer.CancellationToken);
+                busHandle = bus.Start();
 
                 _log.InfoFormat("Created client {0}", bus.Address);
-
-                busHandle = task.Result;
-
             }, false);
 
             Stopwatch clientTimer = null;
@@ -302,7 +290,7 @@
 
             composer.Execute(() => clientTimer = Stopwatch.StartNew());
 
-           for (int requestClient = 0; requestClient < _requestsPerInstance; requestClient++)
+            for (int requestClient = 0; requestClient < _requestsPerInstance; requestClient++)
             {
                 int clientIndex = requestClient;
 
@@ -323,18 +311,16 @@
                                     : _messageContent;
                                 var requestMessage = new StressfulRequestMessage(messageContent);
 
-                                var response = messageClient.Request(requestMessage).Result;
+                                StressfulResponseMessage response = messageClient.Request(requestMessage).Result;
 
                                 Interlocked.Increment(ref _responseCount);
 
-                                            TimeSpan timeSpan = response.Timestamp - requestMessage.Timestamp;
-                                            Interlocked.Add(ref _responseTime, (long)timeSpan.TotalMilliseconds);
-                                            _timings[instance][clientIndex * _iterations + iteration] = (int)timeSpan.TotalMilliseconds;
+                                TimeSpan timeSpan = response.Timestamp - requestMessage.Timestamp;
+                                Interlocked.Add(ref _responseTime, (long)timeSpan.TotalMilliseconds);
+                                _timings[instance][clientIndex * _iterations + iteration] = (int)timeSpan.TotalMilliseconds;
 
-                                            if (response.RequestId != requestMessage.RequestId)
-                                            {
-                                                Interlocked.Increment(ref _mismatchedResponseCount);
-                                            }
+                                if (response.RequestId != requestMessage.RequestId)
+                                    Interlocked.Increment(ref _mismatchedResponseCount);
 
                                 Interlocked.Increment(ref _requestCount);
                             });
