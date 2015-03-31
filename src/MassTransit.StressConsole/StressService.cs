@@ -4,15 +4,13 @@
     using System.Collections.Generic;
     using System.Diagnostics;
     using System.Linq;
-    using System.Text.RegularExpressions;
     using System.Threading;
     using System.Threading.Tasks;
+    using Internals.Extensions;
     using Magnum.Extensions;
     using RabbitMQ.Client;
-    using RabbitMQ.Client.Exceptions;
     using RabbitMqTransport;
     using RabbitMqTransport.Configuration;
-    using Taskell;
     using Topshelf;
     using Topshelf.Logging;
 
@@ -22,6 +20,7 @@
     {
         readonly CancellationTokenSource _cancel;
         readonly bool _cleanUp;
+        readonly bool _durable;
         readonly ushort _heartbeat;
         readonly int _instances;
         readonly int _iterations;
@@ -30,27 +29,28 @@
         readonly int _messageSize;
         readonly bool _mixed;
         readonly string _password;
+        readonly string _queueName;
+        readonly int _requestsPerInstance;
         readonly Uri _serviceBusUri;
         readonly string _username;
+        BusHandle _busHandle;
         IList<Task> _clientTasks;
+        Uri _clientUri;
         int _consumerLimit;
-        readonly int _requestsPerInstance;
-        readonly string _queueName;
         Stopwatch _generatorStartTime;
         HostControl _hostControl;
         int _instanceCount;
+        int _mismatchedResponseCount;
         int _prefetchCount;
         int _requestCount;
         int _responseCount;
-        int _mismatchedResponseCount;
         long _responseTime;
         IBusControl _serviceBus;
         int[][] _timings;
         long _totalTime;
-        BusHandle _busHandle;
-        Uri _clientUri;
 
-        public StressService(Uri serviceBusUri, string username, string password, ushort heartbeat, int iterations, int instances, int messageSize, bool cleanUp, bool mixed, int prefetchCount, int consumerLimit, int requestsPerInstance, string queueName)
+        public StressService(Uri serviceBusUri, string username, string password, ushort heartbeat, int iterations, int instances, int messageSize, bool cleanUp,
+            bool mixed, int prefetchCount, int consumerLimit, int requestsPerInstance, string queueName, bool durable)
         {
             _username = username;
             _password = password;
@@ -62,6 +62,7 @@
             _consumerLimit = consumerLimit;
             _requestsPerInstance = requestsPerInstance;
             _queueName = queueName;
+            _durable = durable;
             _cleanUp = cleanUp;
             _mixed = mixed;
             _serviceBusUri = serviceBusUri;
@@ -84,12 +85,13 @@
             _log.InfoFormat("Clients: {0}", _instances);
             _log.InfoFormat("Requests Per Client: {0}", _requestsPerInstance);
             _log.InfoFormat("Heartbeat: {0}", _heartbeat);
+            _log.InfoFormat("Durable: {0}", _durable);
             _log.InfoFormat("Consumer Limit: {0}", _consumerLimit);
 
             int workerThreads;
             int completionPortThreads;
             ThreadPool.GetMinThreads(out workerThreads, out completionPortThreads);
-            var threads = workerThreads + (_instances * _requestsPerInstance + _consumerLimit);
+            int threads = workerThreads + (_instances * _requestsPerInstance + _consumerLimit);
             ThreadPool.SetMinThreads(threads, completionPortThreads);
 
             _log.InfoFormat("Setting minimum thread count: {0}", threads);
@@ -103,64 +105,63 @@
             Stopwatch handlerTimer = null;
             _serviceBus = Bus.Factory.CreateUsingRabbitMq(x =>
             {
-                var host = x.Host(_serviceBusUri, h =>
-                    {
-                        h.Username(_username);
-                        h.Password(_password);
-                        h.Heartbeat(_heartbeat);
-                    });
+                IRabbitMqHost host = x.Host(_serviceBusUri, h =>
+                {
+                    h.Username(_username);
+                    h.Password(_password);
+//                    h.Heartbeat(_heartbeat);
+                });
 
                 x.ReceiveEndpoint(host, _queueName, endpoint =>
                 {
                     endpoint.PrefetchCount = (ushort)_consumerLimit;
-                    endpoint.Handler<StressfulRequest>(context =>
+                    endpoint.Durable(_durable);
+                    endpoint.Handler<StressfulRequest>(async context =>
                     {
                         if (handlerTimer == null)
                             handlerTimer = Stopwatch.StartNew();
 
-                        counter++;
-                        if (counter % 100 == 0)
+                        var count = Interlocked.Increment(ref counter);
+                        if (count % 500 == 0)
                         {
-                            Console.SetCursorPosition(0, Console.CursorTop);
-                            Console.Write("{0} / {1} ({2}/second)", counter, expected, (counter * 1000) / handlerTimer.ElapsedMilliseconds);
+                            lock (Console.Out)
+                            {
+                                Console.SetCursorPosition(0, Console.CursorTop);
+                                Console.Write("{0} / {1} ({2}/second)", count, expected, (count * 1000) / handlerTimer.ElapsedMilliseconds);
+                            }
                         }
 
                         // just respond with the Id
-                        return context.RespondAsync(new StressfulResponseMessage(context.Message.RequestId));
+                        context.Respond(new StressfulResponseMessage(context.Message.RequestId));
                     });
                 });
             });
 
-            var start = _serviceBus.Start();
-            start.Wait(_cancel.Token);
-
-            _busHandle = start.Result;
+            _busHandle = _serviceBus.Start();
 
             _log.InfoFormat("Started: {0}", _serviceBus.Address);
 
             hostControl.RequestAdditionalTime(TimeSpan.FromSeconds(30));
 
             _generatorStartTime = Stopwatch.StartNew();
-            StartStressGenerators(hostControl).Wait(_cancel.Token);
+
+            StartStressGenerators(hostControl).Wait();
 
             return true;
         }
 
         public bool Stop(HostControl hostControl)
         {
-            bool wait = Task.WaitAll(_clientTasks.ToArray(), (_iterations * _instances / 100).Seconds());
-            if (wait)
-            {
-                _generatorStartTime.Stop();
+            Task.WhenAll(_clientTasks).Wait();
+
+            _generatorStartTime.Stop();
 
                 _log.InfoFormat("RabbitMQ Stress Test Completed");
                 _log.InfoFormat("Request Count: {0}", _requestCount);
                 _log.InfoFormat("Response Count: {0}", _responseCount);
 
                 if (_mismatchedResponseCount > 0)
-                {
                     _log.ErrorFormat("Mismatched Response Count: {0}", _mismatchedResponseCount);
-                }
 
                 _log.InfoFormat("Average Resp Time: {0}ms", _responseTime / _responseCount);
 
@@ -176,19 +177,16 @@
                     (_requestCount + _responseCount) * 1000 / (_totalTime / _instances));
 
                 DrawResponseTimeGraph();
-            }
 
             _cancel.Cancel();
 
             if (_busHandle != null)
-            {
-                _busHandle.Stop().Wait();
-            }
+                _busHandle.Stop();
 
             if (_cleanUp)
                 CleanUpQueuesAndExchanges();
 
-            return wait;
+            return true;
         }
 
         void CleanUpQueuesAndExchanges()
@@ -254,114 +252,85 @@
                 hostControl.RequestAdditionalTime(TimeSpan.FromSeconds(30));
             }
 
-            await Task.WhenAll(starting.ToArray());
+            await Task.WhenAll(starting);
 
             start.TrySetResult(true);
         }
 
-        Task StartStressGenerator(int instance, Task start)
+        async Task StartStressGenerator(int instance, Task start)
         {
-            var ready = new TaskCompletionSource<bool>();
+            await Task.Yield();
 
-            var composer = new TaskComposer<bool>(_cancel.Token, false);
+            Interlocked.Increment(ref _instanceCount);
 
-            composer.Execute(() => { Interlocked.Increment(ref _instanceCount); });
+            _log.InfoFormat("Creating client {0}", instance);
 
-            IBusControl bus = null;
-            BusHandle busHandle = null;
-            composer.Execute(() =>
+            IBusControl bus = Bus.Factory.CreateUsingRabbitMq(x =>
             {
-                _log.InfoFormat("Creating client {0}", instance);
-                
-                bus = Bus.Factory.CreateUsingRabbitMq(x =>
+                x.Host(_serviceBusUri, h =>
                 {
-                    x.Host(_serviceBusUri, h =>
-                    {
-                        h.Username(_username);
-                        h.Password(_password);
-                        h.Heartbeat(_heartbeat);
-                    });
+                    h.Username(_username);
+                    h.Password(_password);
+                    h.Heartbeat(_heartbeat);
                 });
-
-                var task = bus.Start(composer.CancellationToken);
-                task.Wait(composer.CancellationToken);
-
-                _log.InfoFormat("Created client {0}", bus.Address);
-
-                busHandle = task.Result;
-
-            }, false);
-
-            Stopwatch clientTimer = null;
-
-            composer.Execute(() =>
-            {
-                ready.TrySetResult(true);
-                return start;
             });
 
-            composer.Execute(() => clientTimer = Stopwatch.StartNew());
+            BusHandle busHandle = bus.Start();
 
-           for (int requestClient = 0; requestClient < _requestsPerInstance; requestClient++)
+            _log.InfoFormat("Created client {0}", bus.Address);
+
+            _clientTasks.Add(start.ContinueWith(async _ =>
             {
-                int clientIndex = requestClient;
+                _log.InfoFormat("Starting client {0}", instance);
 
-                composer.Execute(() =>
+                Stopwatch clientTimer = Stopwatch.StartNew();
+
+                for (int requestClient = 0; requestClient < _requestsPerInstance; requestClient++)
                 {
+                    int clientIndex = requestClient;
+
                     IRequestClient<StressfulRequestMessage, StressfulResponseMessage> messageClient =
                         new MessageRequestClient<StressfulRequestMessage, StressfulResponseMessage>(bus, _clientUri, TimeSpan.FromMinutes(5));
 
-                    Task task = composer.Compose(x =>
+                    for (int i = 0; i < _iterations; i++)
                     {
-                        for (int i = 0; i < _iterations; i++)
-                        {
-                            int iteration = i;
-                            x.Execute(() =>
-                            {
-                                string messageContent = _mixed && iteration % 2 == 0
-                                    ? new string('*', 128)
-                                    : _messageContent;
-                                var requestMessage = new StressfulRequestMessage(messageContent);
+                        int iteration = i;
+                        string messageContent = _mixed && iteration % 2 == 0
+                            ? new string('*', 128)
+                            : _messageContent;
+                        var requestMessage = new StressfulRequestMessage(messageContent);
 
-                                var response = messageClient.Request(requestMessage).Result;
+                        StressfulResponseMessage response = await messageClient.Request(requestMessage);
 
-                                Interlocked.Increment(ref _responseCount);
+                        Interlocked.Increment(ref _responseCount);
 
-                                            TimeSpan timeSpan = response.Timestamp - requestMessage.Timestamp;
-                                            Interlocked.Add(ref _responseTime, (long)timeSpan.TotalMilliseconds);
-                                            _timings[instance][clientIndex * _iterations + iteration] = (int)timeSpan.TotalMilliseconds;
+                        TimeSpan timeSpan = response.Timestamp - requestMessage.Timestamp;
+                        Interlocked.Add(ref _responseTime, (long)timeSpan.TotalMilliseconds);
+                        _timings[instance][clientIndex * _iterations + iteration] = (int)timeSpan.TotalMilliseconds;
 
-                                            if (response.RequestId != requestMessage.RequestId)
-                                            {
-                                                Interlocked.Increment(ref _mismatchedResponseCount);
-                                            }
+                        if (response.RequestId != requestMessage.RequestId)
+                            Interlocked.Increment(ref _mismatchedResponseCount);
 
-                                Interlocked.Increment(ref _requestCount);
-                            });
-                        }
-                    });
+                        Interlocked.Increment(ref _requestCount);
+                    }
+                }
 
-                    return task;
-                });
-            }
+                clientTimer.Stop();
+                _log.InfoFormat("Stopping client {0}", instance);
 
-            composer.Execute(() => clientTimer.Stop());
+                try
+                {
+                    await busHandle.Stop(_cancel.Token);
+                }
+                catch (Exception)
+                {
+                }
 
-            composer.Execute(() => busHandle.Stop(composer.CancellationToken).Wait(composer.CancellationToken), false);
-
-            composer.Compensate(compensation => { return compensation.Handled(); });
-
-            composer.Finally(status =>
-            {
                 Interlocked.Add(ref _totalTime, clientTimer.ElapsedMilliseconds);
                 int count = Interlocked.Decrement(ref _instanceCount);
                 if (count == 0)
                     Task.Factory.StartNew(() => _hostControl.Stop());
-            }, false);
-
-            _clientTasks.Add(composer.Finish());
-
-            return ready.Task;
+            }, _cancel.Token, TaskContinuationOptions.LongRunning, TaskScheduler.Default));
         }
 
 
