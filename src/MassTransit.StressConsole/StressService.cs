@@ -46,6 +46,8 @@
         IServiceBus _serviceBus;
         int[][] _timings;
         long _totalTime;
+        int _currentHandlerCount;
+        int _maxHandlerCount;
 
         public StressService(Uri serviceBusUri, string username, string password, ushort heartbeat, int iterations, int instances, int messageSize, bool cleanUp, bool mixed, int prefetchCount, int consumerLimit, int requestsPerInstance)
         {
@@ -125,8 +127,14 @@
 
                 x.Subscribe(s => s.Handler<StressfulRequest>((context, message) =>
                 {
+                    int currentHandlerCount = Interlocked.Increment(ref _currentHandlerCount);
+                    while (currentHandlerCount > _maxHandlerCount)
+                        Interlocked.CompareExchange(ref _maxHandlerCount, currentHandlerCount, _maxHandlerCount);
+
                     // just respond with the Id
                     context.Respond(new StressfulResponseMessage(message.RequestId));
+
+                    Interlocked.Decrement(ref _currentHandlerCount);
                 }));
             });
 
@@ -146,6 +154,7 @@
                 _log.InfoFormat("RabbitMQ Stress Test Completed");
                 _log.InfoFormat("Request Count: {0}", _requestCount);
                 _log.InfoFormat("Response Count: {0}", _responseCount);
+                _log.InfoFormat("Max Handler Count: {0}", _maxHandlerCount);
 
                 if (_mismatchedResponseCount > 0)
                 {
