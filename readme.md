@@ -16,7 +16,7 @@ This console application is designed to test RabbitMQ under load.
 The username/password for the server can be specified using the following options:
 
 ```
-	-username "username" -password "password"
+	-rmqusername "username" -rmqpassword "password"
 ```
 
 ## Server URI
